@@ -4,6 +4,86 @@
 
 来源：[课程](https://aiengineeringfromscratch.com/lesson?path=phases/05-nlp-foundations-to-advanced/07-pos-tagging-parsing) · [原课文档](https://github.com/rohitg00/ai-engineering-from-scratch/blob/main/phases/05-nlp-foundations-to-advanced/07-pos-tagging-parsing/docs/en.md)。原题：POS Tagging and Syntactic Parsing。
 
+## 零、初学者先读：给每个词贴上"词性标签"，再看它们谁管谁
+
+> 2026-11-06 新增的教学补充。首次学习先读本节，再进入后面的公式、原课代码与纠错。本课还第01课的债：词形还原需要知道 running 是动词才能还原成 run（[第01课](<01：文本处理——分词、词干提取与词形还原.md>)8.2 节不传词性函数时 were、running 全被当名词）；[第06课](<06：命名实体识别——BIO、规则、CRF与神经模型.md>)给词贴实体标签，本课贴的是语法标签，并进一步建句法树。
+
+### 0.1 先理解这一课在做什么
+
+两个任务，别混为一谈：
+
+1. **词性标注（POS tagging）**：给每个 token 一个语法类别——The/DET、cats/NOUN、were/AUX、running/VERB。
+2. **句法分析（syntactic parsing）**：恢复句子的结构——谁修饰谁、哪个动词支配哪些词（依存树）。贴完词性不会自动得到树。
+
+词性标注为什么不能"查词典"了事：同一个词在不同句子里词性不同。time flies（时光飞逝）里 flies 是动词；fruit flies（果蝇）里 flies 是名词。词典给不出答案，答案在上下文里。本课两级方案：
+
+- **MFT（最常见标签）**：给每个词记训练中最常出现的词性，逐词查表。像只看个人档案不看现场——档案说 flies 多半是动词，就永远标动词。
+- **HMM**：在档案之外还看"排队顺序"——DET 后面跟 NOUN 很常见、跟 VERB 很罕见。前一个标签参与决定当前标签。
+
+0.3 用两个词的句子把"MFT 怎么错、HMM 怎么扳回来"手算一遍。
+
+### 0.2 本课术语先翻成白话
+
+- POS（part of speech，词性）=名词、动词、形容词这类语法类别
+- 标签集（tagset）=一套词性符号约定。**PTB**（Penn Treebank）是英语细标签：NN 单数名词、NNS 复数、VBD 过去式，约 36 个；**UD**（Universal Dependencies）是跨语言粗标签：NOUN、VERB、AUX，17 个
+- MFT（most frequent tag，最常见标签）=每词取训练中最频标签的基线
+- HMM（hidden Markov model，隐马尔可夫模型）=标签序列的生成模型：先按转移概率走标签，再按发射概率吐词
+- 转移（transition）P(t_i|t_{i−1})=前一标签是它时当前标签的概率（衔接信息）
+- 发射（emission）P(w_i|t_i)=标签是这个时吐出这个词的概率（词典信息）
+- Viterbi（维特比）=在"位置×标签"的格子里做动态规划，找整句联合分数最高的标签路径
+- 平滑（smoothing）=给没数到的计数加小数，避免概率为 0
+- 成分句法（constituency parsing）=NP/VP/PP 短语层层嵌套成树
+- 依存句法（dependency parsing）=每个词有一个支配词（head），边带关系名（dependent）
+- root（根）=整句的根节点，通常是主要动词
+- BOS / EOS=句首/句尾的虚拟哨兵标签，让转移概率在边界处也能统一处理
+- 混淆/OOV 准确率=评估词性标注器的两个切面：标签之间的混淆矩阵；词表外词（训练没见过的词）上的准确率——OOV 才是拉开模型差距的地方
+
+### 0.3 用小数字走一遍
+
+两个词的句子：tokens = ["the", "flies"]，语境是"这些果蝇"（the flies），正确标签 DET NOUN。
+
+**第一步：MFT 查表。** 训练语料里 the 每次都是 DET；flies 标了 6 次 VERB（time flies 之类）、4 次 NOUN（fruit flies 之类）。MFT 的规则是"谁多选谁"：flies→VERB。输出 DET VERB——**错**。错因：MFT 只看单词档案，完全不看当前句子里前后是谁。
+
+**第二步：HMM 补上衔接信息。** 两张训练数出的表（假设值）：
+
+~~~text
+发射（各标签吐出 flies 的概率）：P(flies|VERB)=0.6   P(flies|NOUN)=0.4
+转移（前一标签是 DET 时）：    P(VERB|DET)=0.01   P(NOUN|DET)=0.6
+~~~
+
+单看发射，VERB 确实更高（0.6 > 0.4）——MFT 错得"有道理"。但 the 已定为 DET，比较两条路径的联合概率：
+
+~~~text
+DET→VERB：0.01 × 0.6 = 0.006
+DET→NOUN：0.6 × 0.4 = 0.24   ← 胜出（40 倍）
+~~~
+
+**DET 的转移把天平扳向 NOUN**——冠词后面跟名词常见、跟动词罕见，这条衔接知识是 MFT 没有的。取对数后即 −5.12 对 −1.43，把乘法换加法、结论不变，这正是正文 Viterbi 用的形式。Viterbi 做的事：把这种"两条路比一比"在每个位置对所有标签组合系统做一遍——格子 V[i][j] 存"到词 i 且标签 j 的最优分数"，back 存最优前驱，终点取最大后回溯——不是每步贪心。
+
+以上是用于理解的算例，不是新增的训练或性能实测（数字已用本机 Python 复核，乘法可纸笔验证）。
+
+### 0.4 怎样连接到正文代码
+
+四个分段对应四步：train_mft / predict_mft（4.1，统计每词最频标签与全局默认标签）→ train_hmm / log_prob / viterbi（4.2，先数转移与发射两张计数表，再在 (T,K) 分数格上动态规划）→ 4.3 讨论现代模型差异 → 4.4 依存句法与 spaCy 管线（pos_/tag_/dep_/head 四个属性）。第五节的最小例子里 MFT 与 HMM 输出恰好相同（样本太少），要看出差别得换 0.3 这类歧义句。
+
+一个提醒：原课约 85%（MFT）与约 93%（HMM）的 Brown 语料准确率是"原课参考"数值，不是本机实测；标签集、划分方式与 OOV 比例都会移动这两个数。
+
+### 0.5 理解检查（含参考答案）
+
+**问题1：** MFT 对 "the flies" 输出什么？为什么？
+
+**参考答案：** DET VERB。flies 在训练里 6 次标 VERB、4 次 NOUN，MFT 对每个词独立取最频标签、不看上下文；6>4 所以永远输出 VERB。
+
+**问题2：** HMM 的两张表各回答什么问题？0.3 里是哪张表纠正了 MFT？
+
+**参考答案：** 发射表 P(w|t) 回答"这个标签下会吐出这个词吗"（词典信息）；转移表 P(t_i|t_{i−1}) 回答"标签之间怎么衔接"（语法信息）。0.3 里发射其实偏向 VERB，是转移 P(NOUN|DET)=0.6 把结果扳成 NOUN。
+
+**问题3：** Viterbi 与"逐词挑最优"差在哪？
+
+**参考答案：** 逐词/每步贪心只保留当前最高分，可能因局部最优错过全局最优；Viterbi 在每个位置为每个标签保留"到此为止的最优前驱"，终点取最大后回溯，保证整条路径联合分数最高。
+
+能解释这个小例后，继续阅读下文"核心概念与推导"。
+
 ## 一、这一课解决什么问题？
 
 上一课文本处理需要知道词在当前句子中的角色。本课分别研究“每词是什么词性”和“词与词怎样形成句法关系”。这两项不是同一个任务：给词贴NOUN/VERB标签，并没有自动得到依存树。
@@ -12,11 +92,58 @@
 
 PTB是英语细粒度标签，如NN、NNS、VBD；UD提供17个粗粒度类别，如NOUN、VERB、AUX。PTB常说36个主要词性标签，实际还可能包含标点和特殊标签，不要把标签数量当所有工具都相同。
 
+（补充 2026-11-06）两套标签集的选择可以对照成表：
+
+| | PTB（Penn Treebank） | UD（Universal Dependencies） |
+|---|---|---|
+| 粒度 | 细：NNS 区分复数、VBD 区分过去式 | 粗：一律 NOUN、VERB |
+| 数量 | 约 36 个主要标签+标点特殊标签 | 17 个 |
+| 设计目标 | 英语本土语料标注 | 跨语言统一，方便多语迁移 |
+| 典型场景 | 英文遗留管线、需要词形细节 | 多语种项目、依存树库 |
+
+同一个词在两套下的"分辨率"不同：cats 在 PTB 是 NNS（复数）、在 UD 是 NOUN——词形细节被故意抹掉，换来"名词"这个概念在英语和日语里标签相同。spaCy 里 token.tag_ 是细标签、token.pos_ 是粗标签（4.4 的输出两列都有），下游要形态细节读 tag_、要跨语对齐读 pos_。
+
 成分句法把NP/VP/PP等短语嵌套成树；依存句法用head→dependent并附关系名。root有特殊根约定；其他词通常有一个head。spaCy的关系名不一定与某份UD树库完全一致。
+
+（补充 2026-11-06）用 4.4 那句 "The cats were running at 3pm." 把依存边画成文字版（读法：左边的词是 dependent，──关系──▶ 指向 head）：
+
+~~~text
+The   ──det───▶ cats
+cats  ──nsubj─▶ running      （主语）
+were  ──aux───▶ running      （助动词）
+running ◀── ROOT             （全句唯一的根）
+at    ──prep──▶ running
+3pm   ──pobj──▶ at           （介词宾语，挂在 at 下）
+.     ──punct─▶ running
+~~~
+
+两条结构约束：除 root 外每个词恰好一个 head（否则不是树）；全句恰一个 root（通常是主要动词）。注意 3pm 挂在 at 下面而不是 running 下面——介词宾语归介词管。这就是著名的"介词附着"问题：换一句话归属就可能变（see the bird with the telescope 里 with 短语挂 bird 还是挂 see，意思完全不同），它是句法分析器的经典考题，也是下游抽取规则常错的地方。
 
 MFT为每个小写词记训练中最多的标签，未见词返回全局多数类。HMM同时利用转移P(t_i|t_(i−1))与发射P(w_i|t_i)，用Viterbi寻找整句最大联合分数，不是每步贪心。
 
+（补充 2026-11-06）MFT 的失败有一批经典歧义词，见一个就想到它：
+
+~~~text
+book：I bought a book（NOUN 名词）/ I will book a table（VERB 动词）
+can：I can go（AUX 助动词）/ a can of soup（NOUN 名词）/ to can food（VERB）
+saw：I saw the movie（VERB 过去式）/ the saw（NOUN 锯子，前面有 the 就该是名词）
+~~~
+
+MFT 对这类词几乎必错——只认最频标签、不看现场。HMM 能靠相邻标签纠一部分：the 后面接 NOUN 的概率远高于接 VERB，"the saw" 因此能标对。但 bigram HMM 只看得到紧邻的前一个标签，证据若在更远处（I saw the movie 的主语 I 隔了几个词）就够不着了。这个"看多远"的缺口，正是 CRF（任意特征窗口）与 BiLSTM/Transformer（全句上下文）各自改进的方向；零节 0.3 的 "the flies" 手算演示的就是"相邻标签扳回全局"这件事。
+
 Viterbi递推：当前位置某标签的最佳分数=所有前一标签候选中“前一最佳分数+转移对数概率”的最大值，再加当前发射对数概率；back记录最优前驱，最后回溯。训练计数不是解码结果。
+
+（补充 2026-11-06）把零节 0.3 的两词例子排成 Viterbi 格子（行=词、列=标签、格子里存 log 分数，数值对应 0.3 的假设概率）：
+
+~~~text
+             DET                                NOUN
+the      log P(DET|BOS)+log P(the|DET)      log P(NOUN|BOS)+log P(the|NOUN)（很低）
+flies    max_prev [V[0][prev]+log P(DET|prev)]
+                                          + log P(flies|DET)（很低）
+                                          max_prev [V[0][prev]+log P(NOUN|prev)] + log P(flies|NOUN) ← 最优
+~~~
+
+填第二行任一格时，"max_prev"要在前一行的所有标签里挑出最优前驱，把它的分数加转移进来——这就是正文"所有前一标签候选取最大"的具体动作。终点在 NOUN 列取最大，back 里存的指针逐格指回 DET，回溯得到 DET NOUN。对比每步贪心：贪心在第一行就只留一个活口，第二行没得比；Viterbi 每列都保留"到此为止的最优"，所以不会因局部最优锁死整句。
 
 ### 2.9 用一个小例子把概念串起来（补充）
 
