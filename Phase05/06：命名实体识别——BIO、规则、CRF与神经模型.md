@@ -4,6 +4,88 @@
 
 来源：[课程](https://aiengineeringfromscratch.com/lesson?path=phases/05-nlp-foundations-to-advanced/06-named-entity-recognition) · [原课文档](https://github.com/rohitg00/ai-engineering-from-scratch/blob/main/phases/05-nlp-foundations-to-advanced/06-named-entity-recognition/docs/en.md)。原题：Named Entity Recognition。
 
+## 零、初学者先读：从一句话里把"名字"挑出来
+
+> 2026-11-06 新增的教学补充。首次学习先读本节，再进入后面的公式、原课代码与纠错。[第05课](<05：情感分析——朴素贝叶斯、逻辑回归与评估.md>)把整句话当一个袋子判断情绪；本课开始关心每个词是谁——哪些词是公司、地名、人名、产品。[第01课](<01：文本处理——分词、词干提取与词形还原.md>)的 tokenize 在这里是前置工序。
+
+### 0.1 先理解这一课在做什么
+
+NER（Named Entity Recognition，命名实体识别）=从文本里找出实体并标上类型。例句：
+
+~~~text
+Apple sued Google over its iPhone search deal in the US.
+~~~
+
+人一眼看出 Apple、Google 是公司、US 是国家；程序要输出 Apple(ORG)、Google(ORG)、iPhone(PRODUCT)、US(GPE) 这几组"是谁+什么类型"。它难在三点：
+
+1. **边界**：New York City 是三个词一个实体，还是三个实体？
+2. **类型/歧义**：Apple 是水果还是公司？US 是地名还是"我们"？
+3. **没见过的**：新公司名、新药名，词典里查不到。
+
+本课最关键的一步转化：把"找实体"变成"**逐词贴标签**"的序列标注问题——给每个 token 发一张身份牌（B-ORG、I-GPE、O……），再从牌的序列拼出实体。这个转化之后，第05课的分类思想（每个单位一个标签）就能继续用；剩下的问题是"标签序列要衔接合法"，这正是 BIO 记号与 CRF 各自登场的原因。
+
+### 0.2 本课术语先翻成白话
+
+- NER（命名实体识别）=识别实体边界与类型的任务
+- 实体（entity）=想抽取的对象：人名、组织、地名、产品、日期……具体哪些算由标注规范定
+- BIO=一种贴牌方案：B-X 开头（Begin）、I-X 续内（Inside）、O 无关（Outside）
+- BILOU=再细化：加 L-X（实体最后一位）与 U-X（单字实体）
+- span（跨度）=实体的 (起始, 结束, 类型) 三元组；本课用 token 下标、左闭右开 [start, end)
+- gazetteer（实体词典）=手工/爬来的"名单表"，查表精确匹配
+- emission（发射分数）=单个 token 自身证据给各标签打的分
+- transition（转移分数）=相邻两标签衔接好坏的分：O→I-GPE 是坏衔接，B-GPE→I-GPE 是好衔接
+- CRF（条件随机场，Conditional Random Field）=给整条标签序列一起打分（发射+转移）的模型
+- HMM（隐马尔可夫模型）=更早的序列模型，只统计转移与发射概率
+- BiLSTM=双向长短期记忆网络，从左右两个方向读句子、产出上下文特征
+- entity-level F1（实体级 F1）=预测跨度与真实跨度**边界+类型完全一致**才算对的指标
+- aggregation_strategy=HF pipeline 把子词级标签聚合回词/跨度的参数
+
+### 0.3 用小数字走一遍
+
+三个词的句子：tokens = ["New", "York", "hosts"]。真实情况：New York 是地名（GPE），hosts 是普通词。期望标签 B-GPE、I-GPE、O，span=(0, 2, "GPE")。
+
+**第一步：逐词证据打分（emission，假设值）。**
+
+~~~text
+        B-GPE   I-GPE   O
+New      0.5      —    0.6
+York      —     0.6    0.3
+hosts     —       —    0.5
+~~~
+
+**第二步：逐词独立挑最大（局部 argmax）会怎样。** New→O（0.6 最大）、York→I-GPE（0.6 最大）、hosts→O。拼出 O→I-GPE→O——**非法序列**：I- 前面必须有 B-，"凭空开始的实体"不存在。
+
+**第三步：加上衔接分数（transition，假设值）重比两条路。** 设 O→I-GPE = −2（重罚），B-GPE→I-GPE = +1（奖励），其余相关转移为 0：
+
+~~~text
+非法路 O→I-GPE→O：  0.6 + 0.6 + 0.5 + (−2) + 0 = −0.3
+合法路 B→I→O：      0.5 + 0.6 + 0.5 + (+1) + 0 = +2.6   ← 胜出
+~~~
+
+合法路每一格的逐词分数都略逊或持平，总分却反超——因为好的衔接被奖励了。**CRF 的全部作用就在这一步**：不再每个词独立挑最高分，而是整条序列一起打分、选合法且总分最高的路径。BiLSTM、Transformer 的角色只是把第一步的"逐词证据"算得更准（更好的 emission），序列层面的合法性仍要靠转移分数（CRF 或解码约束）来保证。
+
+以上是用于理解的算例，不是新增的训练或性能实测（数字已用本机 Python 复核，纯加法可纸笔验证）。读下面的概念与代码时，把 spans_to_bio、CRF、emission 先对应回这里的对象。
+
+### 0.4 怎样连接到正文代码
+
+正文按"表示→特征→模型"展开：spans_to_bio / bio_to_spans（4.1，span 与 BIO 标签互相转换；注意孤立 I 被丢弃是原实现的容错约定）→ token_features + word_shape（4.2，把大小写、后缀、形状做成特征；iPhone 的形状是 xXxxxx）→ rule_based_ner + 三个 GAZETTEER（4.3，查表基线，只认单 token 词）→ to_features + crf.fit（4.4，sklearn-crfsuite 真 CRF，c1/c2 是正则系数）→ BiLSTM_CRF_Head（4.5，名字带 CRF 但只输出 emissions，没有 CRF 层）。第五节有零依赖的最小闭环测试。
+
+### 0.5 理解检查（含参考答案）
+
+**问题1：** 只用一个 GPE 标签（不分 B-/I-）会丢掉什么能力？
+
+**参考答案：** 无法表达多词实体的边界：New York City 和 New York 是不同长度的实体，没有 B/I 区分时连续的 GPE 词无法切开；B 开头、I 延续才能把"连续多个 token 组成一个跨度"写进标签序列。
+
+**问题2：** 逐词 argmax 与 CRF 解码的差别，用 0.3 的数字说一遍。
+
+**参考答案：** argmax 得到 O→I-GPE→O（非法）；CRF 把转移分数 −2/+1 加进来后，合法路 +2.6 反超非法路 −0.3。CRF 选的是整条序列总分最高者，不是逐位置最高者。
+
+**问题3：** 4.5 的 BiLSTM_CRF_Head 输出可以直接当最终标签吗？
+
+**参考答案：** 不能。它的 forward 只返回 emissions——形状 (批, 长度, 标签数) 的逐词分数；CRF 层、CRF 损失与解码都还没接上，类名有误导性。
+
+能解释这个小例后，继续阅读下文"核心概念与推导"。
+
 ## 一、这一课解决什么问题？
 
 NER识别文本中的实体边界与类型，例如Apple作为ORG、US作为GPE。并不是所有名词都要标注；search deal是否算实体取决于标注规范。实体体系、字符/token边界和领域约定是模型之前必须确定的内容。
@@ -12,11 +94,52 @@ NER识别文本中的实体边界与类型，例如Apple作为ORG、US作为GPE�
 
 BIO：B-X开始一个X类实体，I-X继续同类实体，O表示非实体。New/B-GPE York/I-GPE City/I-GPE连成一个跨度。BILOU另加U单词实体、L最后位置。
 
+（补充 2026-11-06）BIO 三种牌面可以列成一张小表，配上 "New York City hosts" 的逐词例：
+
+| 标签 | 意思 | 例 |
+|---|---|---|
+| B-X | 一个 X 类实体从这里**开始** | New → B-GPE |
+| I-X | X 类实体**延续**到这个词 | York → I-GPE、City → I-GPE |
+| O | 与任何实体无关 | hosts → O |
+
+两条隐藏规则值得单独点出：①I-X 不能凭空出现，前面必须是同类型的 B-X 或 I-X（O→I-GPE 是非法起点）；②相邻同类型实体也必须各自从 B 起——"Paris, France" 若都标 I-GPE 就黏成一个实体了，B-GPE、(O)、B-GPE 才能分开。BILOU 把"结束"也编进标签（L-X=末位、U-X=单字实体），边界信息更显式，训练时等于免费多了"实体在哪结束"的特征；代价是标签数更多、稀疏类别更难学。
+
 本课span使用token索引[start,end)，end不包含在实体中；它不是字符偏移。要恢复原文字符位置，需保存tokenization offsets。
+
+（补充 2026-11-06）token 索引与字符偏移的区别用一句话记：span 回答"第几个词"，偏移回答"第几个字符"。小例（token 编号从 0 起）：
+
+~~~text
+文本：  New York City hosts
+token：  0    1    2     3
+span (0, 3, "GPE")     ← 第 0、1、2 三个 token
+字符：  New 从 0 到 3，整名从 0 到 12（不含尾空格）
+~~~
+
+同一个 span 在不同分词器下对应的字符区间可能不同（有人把 New York City 切成一个 token，有人切成三个）——所以下游要高亮原文时必须保存分词时的 offsets，不能事后重切再反推。
 
 路线：字典/规则→HMM→CRF→BiLSTM+CRF→Transformer token classifier。CRF对整条标签序列建模，既有每位置emission，也有标签transition；它不是简单给每词独立取argmax。BiLSTM输出上下文特征，CRF再决定序列。
 
+（补充 2026-11-06）五代方法是一条"各接住上一代的问题"的接力，可对照成表：
+
+| 方法 | 强项 | 接住上一代的什么问题 | 留下的新问题 |
+|---|---|---|---|
+| 词典/规则 | 名单内的词零错误 | — | 名单外零覆盖；Apple 水果/公司分不开 |
+| HMM | 可从数据训练出概率 | 规则零泛化 | 特征基本只有词本身 |
+| CRF | 任意特征 + 序列打分 | HMM 特征表达能力受限 | 特征仍要手工设计 |
+| BiLSTM-CRF | 特征自动学出来 | 手工特征的天花板 | 需要较多标注句子 |
+| Transformer | 全句上下文最强 | 前一切 | 算力大；子词与实体边界要对齐 |
+
+读原课路线图时带着这张表：每一代不是"全面更好"，是"修一个具体的洞"。零节 0.3 的转移分数演示了 CRF 那一行"序列打分"具体指什么；4.5 的类名提醒你 BiLSTM-CRF 那一行在原课代码里其实只剩 BiLSTM 半截。
+
 单层BIO只能给每位置一个标签，无法直接表示重叠/嵌套实体。实体级严格F1要求边界和类型同时匹配；token准确率可能被大量O标签抬高。
+
+（补充 2026-11-06）"token 准确率被 O 抬高"值得算一笔账：一个 20 个 token 的句子里有 1 个 4 词实体，其余 16 个都是 O。模型全部猜 O，token 准确率 = 16/20 = 80%，实体数 = 0——看起来"八成正确"，实际一个实体都没找到。这就是必须用实体级 F1 的原因。严格匹配下两种典型错法都同时算 FP 和 FN（预测错一个、真值漏一个）：
+
+~~~text
+真值 (0, 3, GPE)     预测 (0, 2, GPE)   ← 边界错：不算对
+真值 (0, 3, GPE)     预测 (0, 3, ORG)   ← 类型错：不算对
+真值 (0, 3, GPE)     预测 (0, 3, GPE)   ← 边界+类型全对：唯一算 TP 的情形
+~~~
 
 ### 2.9 用一个小例子把概念串起来（补充）
 
